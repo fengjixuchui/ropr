@@ -1,117 +1,16 @@
-use crate::{
-	disassembler::{Bitness, Disassembler},
-	rules::{
-		is_base_pivot_head, is_gadget_tail, is_rop_gadget_head, is_stack_pivot_head,
-		is_stack_pivot_tail,
-	},
-	sections::Section,
+use crate::rules::{
+	is_base_pivot_head, is_rop_gadget_head, is_stack_pivot_head, is_stack_pivot_tail,
 };
 use iced_x86::{Formatter, FormatterOutput, FormatterTextKind, Instruction};
-use std::{
-	cmp::Ordering,
-	hash::{Hash, Hasher},
-};
+use std::hash::Hash;
 
-pub struct Disassembly<'b> {
-	_bytes: &'b [u8],
-	instructions: Vec<Instruction>,
-	file_offset: usize,
-}
-
-impl<'b> Disassembly<'b> {
-	pub fn new(section: &'b Section) -> Option<Self> {
-		let bytes = section.bytes();
-
-		if bytes.is_empty() {
-			return None;
-		}
-
-		let mut instructions = vec![Instruction::default(); bytes.len()];
-		let mut disassembler = Disassembler::new(Bitness::Bits64, bytes);
-
-		// Fully disassemble program
-		for (start, instruction) in instructions.iter_mut().enumerate().take(bytes.len()) {
-			disassembler.decode_at_offset(
-				(section.program_base() + section.section_vaddr() + start) as u64,
-				start,
-				instruction,
-			)
-		}
-
-		Some(Self {
-			_bytes: bytes,
-			instructions,
-			file_offset: section.program_base() + section.section_vaddr(),
-		})
-	}
-
-	pub fn instruction(&self, index: usize) -> &Instruction { &self.instructions[index] }
-
-	pub fn tails<'d>(&'d self, rop: bool, sys: bool, jop: bool, noisy: bool) -> TailsIter<'d, 'b> {
-		TailsIter {
-			disassembly: self,
-			rop,
-			sys,
-			jop,
-			noisy,
-			index: 0,
-		}
-	}
-
-	pub fn gadgets_from_tail(
-		&self,
-		tail: usize,
-		max_instructions: usize,
-		noisy: bool,
-	) -> GadgetIterator {
-		assert!(max_instructions > 0);
-		let start_index = tail.saturating_sub((max_instructions - 1) * 15);
-		GadgetIterator {
-			disassembly: self,
-			tail,
-			start_index,
-			max_instructions,
-			noisy,
-		}
-	}
-}
-
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct Gadget {
-	file_offset: usize,
-	len: usize,
 	instructions: Vec<Instruction>,
-}
-
-impl PartialEq for Gadget {
-	fn eq(&self, other: &Self) -> bool { self.instructions.eq(&other.instructions) }
-}
-
-impl Eq for Gadget {}
-
-impl Hash for Gadget {
-	fn hash<H>(&self, state: &mut H)
-	where
-		H: Hasher,
-	{
-		self.instructions.hash(state);
-	}
-}
-
-impl PartialOrd for Gadget {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-		Some(self.file_offset.cmp(&other.file_offset))
-	}
-}
-
-impl Ord for Gadget {
-	fn cmp(&self, other: &Self) -> Ordering { self.file_offset.cmp(&other.file_offset) }
+	unique_id: usize
 }
 
 impl Gadget {
-	pub fn file_offset(&self) -> usize { self.file_offset }
-
-	pub fn _len(&self) -> usize { self.len }
-
 	pub fn instructions(&self) -> &[Instruction] { &self.instructions }
 
 	pub fn is_stack_pivot(&self) -> bool {
@@ -149,94 +48,99 @@ impl Gadget {
 			}
 		}
 	}
-
-	pub fn format_full(&self, output: &mut impl FormatterOutput) {
-		// Write address
-		output.write(
-			&format!("{:#010x}: ", self.file_offset),
-			FormatterTextKind::Function,
-		);
-		self.format_instruction(output);
-	}
 }
 
-pub struct TailsIter<'b, 'd> {
-	disassembly: &'d Disassembly<'b>,
-	rop: bool,
-	sys: bool,
-	jop: bool,
-	noisy: bool,
-	index: usize,
-}
-
-impl Iterator for TailsIter<'_, '_> {
-	type Item = usize;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		while let Some(instr) = self.disassembly.instructions.get(self.index) {
-			if is_gadget_tail(instr, self.rop, self.sys, self.jop, self.noisy) {
-				let tail = self.index;
-				self.index += 1;
-				return Some(tail);
-			}
-			else {
-				self.index += 1;
-			}
-		}
-		None
-	}
-}
-
-pub struct GadgetIterator<'b, 'd> {
-	disassembly: &'d Disassembly<'b>,
-	tail: usize,
-	start_index: usize,
+pub struct GadgetIterator<'d> {
+	section_start: usize,
+	tail_instruction: Instruction,
+	predecessors: &'d [Instruction],
 	max_instructions: usize,
 	noisy: bool,
+	uniq: bool,
+	start_index: usize,
+	finished: bool,
 }
 
-impl<'b> Iterator for GadgetIterator<'b, '_> {
-	type Item = Gadget;
+impl<'d> GadgetIterator<'d> {
+	pub fn new(
+		section_start: usize,
+		tail_instruction: Instruction,
+		predecessors: &'d [Instruction],
+		max_instructions: usize,
+		noisy: bool,
+		uniq: bool,
+		start_index: usize,
+	) -> Self {
+		Self {
+			section_start,
+			tail_instruction,
+			predecessors,
+			max_instructions,
+			noisy,
+			uniq,
+			start_index,
+			finished: false,
+		}
+	}
+}
+
+impl Iterator for GadgetIterator<'_> {
+	type Item = (Gadget, usize);
 
 	fn next(&mut self) -> Option<Self::Item> {
-		'outer: while self.start_index <= self.tail {
-			let mut instructions = Vec::with_capacity(self.tail - self.start_index + 1);
+		let mut instructions = Vec::new();
 
-			let mut index = self.start_index;
-			while index < self.tail {
-				if instructions.len() == self.max_instructions - 1 {
+		'outer: while !self.predecessors.is_empty() {
+			instructions.clear();
+			let len = self.predecessors.len();
+			let mut index = 0;
+			while index < len && instructions.len() < self.max_instructions - 1 {
+				let instruction = self.predecessors[index];
+				if !is_rop_gadget_head(&instruction, self.noisy) {
+					// Found a bad
+					self.predecessors = &self.predecessors[1..];
 					self.start_index += 1;
 					continue 'outer;
 				}
-
-				let current = &self.disassembly.instructions[index];
-				match is_rop_gadget_head(current, self.noisy) {
-					true => {
-						instructions.push(*current);
-						index += current.len()
-					}
-					false => {
-						self.start_index += 1;
-						continue 'outer;
-					}
-				}
+				instructions.push(instruction);
+				index += instruction.len();
 			}
 
-			if index == self.tail {
-				instructions.push(self.disassembly.instructions[self.tail]);
-				let extra_len = self.disassembly.instructions[self.tail].len();
-				let gadget = Gadget {
-					file_offset: self.disassembly.file_offset + self.start_index,
-					len: self.tail + extra_len - self.start_index,
-					instructions,
+			let current_start_index = self.start_index;
+
+			self.predecessors = &self.predecessors[1..];
+			self.start_index += 1;
+
+			if index == len {
+				instructions.push(self.tail_instruction);
+				// instructions.shrink_to_fit();
+				let unique_id = if self.uniq {
+					0
+				} else {
+					self.section_start + current_start_index
 				};
-				self.start_index += 1;
-				return Some(gadget);
-			}
-			else {
-				self.start_index += 1;
+				return Some((
+					Gadget { instructions, unique_id },
+					self.section_start + current_start_index,
+				));
 			}
 		}
+
+		if !self.finished {
+			self.finished = true;
+			instructions.clear();
+			instructions.push(self.tail_instruction);
+			let unique_id = if self.uniq {
+				0
+			} else {
+				self.section_start + self.start_index
+			};
+			return Some((
+				Gadget { instructions, unique_id },
+				self.section_start + self.start_index,
+			));
+		}
+
 		None
 	}
 }

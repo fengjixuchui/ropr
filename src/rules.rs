@@ -6,6 +6,8 @@ fn is_sys(instr: &Instruction) -> bool {
 	match instr.mnemonic() {
 		Mnemonic::Syscall => true,
 		Mnemonic::Int => matches!(instr.try_immediate(0).unwrap(), 0x80),
+		Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq => true,
+		Mnemonic::Sysret | Mnemonic::Sysretq | Mnemonic::Sysexit | Mnemonic::Sysexitq => true,
 		_ => false,
 	}
 }
@@ -142,6 +144,7 @@ pub fn is_stack_pivot_head(instr: &Instruction) -> bool {
 			matches!(reg0, Register::RSP | Register::ESP | Register::SP)
 				|| matches!(reg1, Register::RSP | Register::ESP | Register::SP)
 		}
+		Mnemonic::Leave => true,
 		_ => false,
 	}
 }
@@ -200,6 +203,7 @@ pub fn is_base_pivot_head(instr: &Instruction) -> bool {
 			matches!(reg0, Register::RBP | Register::EBP | Register::BP)
 				|| matches!(reg1, Register::RBP | Register::EBP | Register::BP)
 		}
+		Mnemonic::Enter => true,
 		_ => false,
 	}
 }
